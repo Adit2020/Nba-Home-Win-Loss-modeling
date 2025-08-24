@@ -294,6 +294,54 @@ class NBAHomeWinLossModel:
         else:
             print("Not enough high-performing models for ensemble")
     
+    def create_weighted_ensemble(self, weights=None):
+        """Create a weighted ensemble based on model performance"""
+        print("\nCreating weighted ensemble...")
+        
+        if weights is None:
+            # Auto-calculate weights based on F1 scores
+            total_f1 = sum(result['f1'] for result in self.results.values())
+            weights = {name: result['f1'] / total_f1 for name, result in self.results.items()}
+        
+        print("Model Weights:")
+        for name, weight in weights.items():
+            print(f"  {name}: {weight:.3f}")
+        
+        # Create weighted predictions
+        weighted_probs = np.zeros(len(self.y_test))
+        
+        for name, weight in weights.items():
+            if name in self.results and 'probabilities' in self.results[name]:
+                weighted_probs += weight * self.results[name]['probabilities']
+        
+        # Convert to predictions
+        y_pred_weighted = (weighted_probs > 0.5).astype(int)
+        
+        # Calculate metrics
+        weighted_accuracy = accuracy_score(self.y_test, y_pred_weighted)
+        weighted_f1 = f1_score(self.y_test, y_pred_weighted)
+        weighted_auc = roc_auc_score(self.y_test, weighted_probs)
+        
+        print(f"\nWeighted Ensemble Results:")
+        print(f"Accuracy: {weighted_accuracy:.4f}")
+        print(f"F1-Score: {weighted_f1:.4f}")
+        print(f"AUC: {weighted_auc:.4f}")
+        
+        # Add to results
+        self.results['Weighted Ensemble'] = {
+            'model': 'Weighted Ensemble',
+            'accuracy': weighted_accuracy,
+            'precision': precision_score(self.y_test, y_pred_weighted),
+            'recall': recall_score(self.y_test, y_pred_weighted),
+            'f1': weighted_f1,
+            'auc': weighted_auc,
+            'predictions': y_pred_weighted,
+            'probabilities': weighted_probs,
+            'weights': weights
+        }
+        
+        return weights
+    
     def plot_feature_importance(self):
         """Plot feature importance for tree-based models"""
         print("\nAnalyzing feature importance...")
@@ -399,7 +447,7 @@ class NBAHomeWinLossModel:
         """Create a prediction function for new games"""
         print("\nCreating prediction function...")
         
-        def predict_home_win(home_stats, away_stats, model=None, use_scaled=True):
+        def predict_home_win(home_stats, away_stats, model=None, use_scaled=True, use_ensemble=True):
             """
             Predict home team win probability for a new game
             
@@ -408,13 +456,18 @@ class NBAHomeWinLossModel:
             away_stats: dict with away team statistics
             model: trained model (uses best model if None)
             use_scaled: whether to use scaled features
+            use_ensemble: whether to use ensemble prediction (recommended)
             
             Returns:
             prediction: 0 (loss) or 1 (win)
             probability: win probability
+            confidence: confidence level in prediction
             """
             if model is None:
-                model = self.best_model
+                if use_ensemble and 'Weighted Ensemble' in self.results:
+                    model = 'Weighted Ensemble'
+                else:
+                    model = self.best_model
             
             # Create feature vector
             features = {}
@@ -444,19 +497,46 @@ class NBAHomeWinLossModel:
             # Reorder columns to match training data
             feature_df = feature_df[self.feature_columns]
             
-            # Scale if needed
-            if use_scaled:
-                feature_df = self.scaler.transform(feature_df)
-            
-            # Make prediction
-            if hasattr(model, 'predict_proba'):
-                prediction = model.predict(feature_df)[0]
-                probability = model.predict_proba(feature_df)[0, 1]
+            if model == 'Weighted Ensemble':
+                # Use weighted ensemble prediction
+                weighted_probs = np.zeros(1)
+                weights = self.results['Weighted Ensemble']['weights']
+                
+                for name, weight in weights.items():
+                    if name in self.results and 'model' in self.results[name]:
+                        # Scale features for models that need it
+                        if name in ['SVM', 'Logistic Regression']:
+                            feature_scaled = self.scaler.transform(feature_df)
+                            prob = self.results[name]['model'].predict_proba(feature_scaled)[0, 1]
+                        else:
+                            prob = self.results[name]['model'].predict_proba(feature_df)[0, 1]
+                        
+                        weighted_probs += weight * prob
+                
+                prediction = (weighted_probs[0] > 0.5).astype(int)
+                probability = weighted_probs[0]
+                
             else:
-                prediction = model.predict(feature_df)[0]
-                probability = None
+                # Use single model prediction
+                # Scale if needed
+                if use_scaled and name in ['SVM', 'Logistic Regression']:
+                    feature_df = self.scaler.transform(feature_df)
+                
+                # Make prediction
+                if hasattr(model, 'predict_proba'):
+                    prediction = model.predict(feature_df)[0]
+                    probability = model.predict_proba(feature_df)[0, 1]
+                else:
+                    prediction = model.predict(feature_df)[0]
+                    probability = None
             
-            return prediction, probability
+            # Calculate confidence based on probability distance from 0.5
+            if probability is not None:
+                confidence = abs(probability - 0.5) * 2  # Scale to 0-1
+            else:
+                confidence = None
+            
+            return prediction, probability, confidence
         
         self.predict_home_win = predict_home_win
         print("Prediction function created!")
@@ -609,6 +689,9 @@ class NBAHomeWinLossModel:
         # Create ensemble
         self.create_ensemble()
         
+        # Create weighted ensemble
+        self.create_weighted_ensemble()
+        
         # Analyze results
         self.plot_feature_importance()
         self.plot_confusion_matrices()
@@ -694,12 +777,19 @@ def main():
         'ROLLING_OE': 0.60
     }
     
-    prediction, probability = model.predict_home_win(home_stats, away_stats)
+    prediction, probability, confidence = model.predict_home_win(home_stats, away_stats, use_ensemble=True)
     
     print(f"Home Team Stats: {home_stats}")
     print(f"Away Team Stats: {away_stats}")
     print(f"Prediction: {'WIN' if prediction == 1 else 'LOSS'}")
     print(f"Win Probability: {probability:.3f}" if probability else "Probability not available")
+    print(f"Confidence: {confidence:.3f}" if confidence else "Confidence not available")
+    
+    # Show which models contributed to the prediction
+    if 'Weighted Ensemble' in model.results:
+        print(f"\nEnsemble Model Weights:")
+        for name, weight in model.results['Weighted Ensemble']['weights'].items():
+            print(f"  {name}: {weight:.3f}")
 
 
 if __name__ == "__main__":
